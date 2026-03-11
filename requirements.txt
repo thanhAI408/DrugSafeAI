@@ -1,0 +1,13 @@
+streamlit
+python-dotenv
+requests
+beautifulsoup4
+tqdm
+pymupdf
+unidecode
+rapidfuzz
+chromadb
+langchain
+langchain-community
+langchain-text-splitters
+langchain-google-genai
