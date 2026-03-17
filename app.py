@@ -11,14 +11,12 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 from urllib import request, error
 
-import numpy as np
 import streamlit as st
 from unidecode import unidecode
 import fitz  # PyMuPDF
 
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
-
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 
@@ -58,6 +56,9 @@ MAX_ENTITIES = 10
 MAX_STOCKLEY_CANDIDATES = 18
 MAX_INTERNAL_PAGES = 70
 
+MAX_RAG_DOCS = 8
+MAX_RAG_CONTEXT_CHARS = 5000
+
 STOCKLEY_START_PAGE = 22
 STOCKLEY_LAST_CONTENT_PAGE = 1587
 
@@ -65,13 +66,19 @@ COLOR_PAIR_BOX = (0.10, 0.10, 0.10)
 COLOR_PAIR_HL = (1.0, 0.92, 0.20)
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+
+# model dịch cho pair mode
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "translategemma:12b")
+
+# model RAG cho free-chat mode
+OLLAMA_RAG_MODEL = os.environ.get("OLLAMA_RAG_MODEL", "llama3.1:8b")
+
 OLLAMA_TIMEOUT_SEC = int(os.environ.get("OLLAMA_TIMEOUT_SEC", "90"))
 
 MAX_SUMMARY_LOOKAHEAD_PAGES = 2
 
-# typo suggestion
-SUGGESTION_MIN_SCORE = 0.72
+FEATURE_PAIRWISE = "Kiểm tra tương tác theo cặp"
+FEATURE_RAG = "Hỏi đáp RAG về tương tác thuốc"
 
 
 # ============================================================
@@ -138,12 +145,21 @@ class PairResult:
 
 
 @dataclass
-class SuggestionItem:
-    raw_text: str
-    suggested_text: str
-    suggested_type: str   # "trade_name" | "active_ingredient" | "other"
-    canonical_if_selected: str
-    score: float
+class RAGChunk:
+    page: int
+    text: str
+    open_url: Optional[str] = None
+
+
+@dataclass
+class GeneralRAGResult:
+    prompt: str
+    normalized_prompt: str
+    entities: List[Entity]
+    answer_vi: Optional[str]
+    answer_raw: Optional[str]
+    chunks: List[RAGChunk]
+    logs: List[AgentLog] = field(default_factory=list)
 
 
 # ============================================================
@@ -195,8 +211,18 @@ def make_block_uid(page_no: int, blk: Dict[str, Any]) -> str:
     )
 
 
+def clean_chunk_text(s: str, max_len: int = 900) -> str:
+    s = clean_inline_text(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len]
+
+
+def regex_term_pattern(term_norm: str) -> re.Pattern:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term_norm)}(?![a-z0-9])", flags=re.I)
+
+
 # ============================================================
-# OLLAMA TRANSLATION
+# OLLAMA
 # ============================================================
 def _ollama_post_json(endpoint: str, payload: Dict[str, Any], timeout: int = OLLAMA_TIMEOUT_SEC) -> Dict[str, Any]:
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
@@ -213,10 +239,10 @@ def _ollama_post_json(endpoint: str, payload: Dict[str, Any], timeout: int = OLL
 
 
 @st.cache_data(show_spinner=False)
-def check_ollama_available() -> Tuple[bool, str]:
+def check_ollama_model_available(model_name: str) -> Tuple[bool, str]:
     try:
         payload = {
-            "model": OLLAMA_MODEL,
+            "model": model_name,
             "prompt": "Reply with exactly: OK",
             "stream": False,
             "options": {"temperature": 0},
@@ -225,11 +251,11 @@ def check_ollama_available() -> Tuple[bool, str]:
         txt = clean_inline_text(obj.get("response", ""))
         if txt:
             return True, ""
-        return False, f"Ollama phản hồi rỗng cho model `{OLLAMA_MODEL}`."
+        return False, f"Ollama phản hồi rỗng cho model `{model_name}`."
     except error.URLError as e:
         return False, f"Không kết nối được Ollama tại {OLLAMA_BASE_URL}: {e}"
     except Exception as e:
-        return False, f"Ollama chưa sẵn sàng hoặc model `{OLLAMA_MODEL}` chưa load được: {e}"
+        return False, f"Ollama chưa sẵn sàng hoặc model `{model_name}` chưa load được: {e}"
 
 
 def cleanup_ollama_translation_output(text: str) -> str:
@@ -298,6 +324,67 @@ TEXT:
         return None, f"Không kết nối được Ollama tại {OLLAMA_BASE_URL}: {e}"
     except Exception as e:
         return None, f"Lỗi dịch qua Ollama model `{model_name}`: {e}"
+
+
+def generate_general_rag_answer(user_prompt: str, chunks: List[RAGChunk]) -> Tuple[Optional[str], Optional[str]]:
+    if not chunks:
+        return None, "Không có context để tổng hợp câu trả lời."
+
+    context_parts = []
+    total_chars = 0
+    for i, ch in enumerate(chunks, start=1):
+        piece = f"[Chunk {i} | page {ch.page}] {ch.text}"
+        if total_chars + len(piece) > MAX_RAG_CONTEXT_CHARS:
+            break
+        context_parts.append(piece)
+        total_chars += len(piece)
+
+    context_text = "\n\n".join(context_parts).strip()
+    if not context_text:
+        return None, "Context rỗng sau khi gom chunk."
+
+    prompt = f"""You are a medical evidence assistant.
+
+Task:
+Answer in Vietnamese, based ONLY on the provided context excerpts from Stockley's Drug Interactions.
+
+User question:
+{user_prompt}
+
+Rules:
+- Only use the context below.
+- Do not invent facts not supported by the context.
+- If the context is insufficient, say clearly that the retrieved excerpts are insufficient.
+- Write a concise answer in Vietnamese (3-6 sentences).
+- Mention that the answer is based on retrieved excerpts from Stockley.
+- Prefer short paragraph form, not bullet-heavy.
+
+CONTEXT:
+{context_text}
+
+FINAL ANSWER IN VIETNAMESE:
+"""
+
+    payload = {
+        "model": OLLAMA_RAG_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 400,
+        },
+    }
+
+    try:
+        obj = _ollama_post_json("/api/generate", payload, timeout=OLLAMA_TIMEOUT_SEC)
+        txt = clean_inline_text(obj.get("response", ""))
+        if not txt:
+            return None, f"Ollama trả về rỗng với model `{OLLAMA_RAG_MODEL}`."
+        return txt, None
+    except error.URLError as e:
+        return None, f"Không kết nối được Ollama tại {OLLAMA_BASE_URL}: {e}"
+    except Exception as e:
+        return None, f"Lỗi sinh câu trả lời RAG qua Ollama model `{OLLAMA_RAG_MODEL}`: {e}"
 
 
 # ============================================================
@@ -373,6 +460,83 @@ def load_alias_sources_index() -> Dict[str, Dict[str, Any]]:
     return idx
 
 
+@st.cache_data(show_spinner=False)
+def build_alias_catalog(alias_map: Dict[str, str], alias_sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    seen = set()
+
+    # alias / tên thương mại
+    for alias, canonical in alias_map.items():
+        alias_norm = norm_text(alias)
+        canonical_norm = norm_text(canonical)
+        if not alias_norm:
+            continue
+
+        src = alias_sources.get(alias_norm) or alias_sources.get(alias) or {}
+        duoc_url = src.get("url")
+        if not duoc_url:
+            try:
+                duoc_url = build_remote_pdf_url("duoc_thu_qg_2018", int(src.get("page", 1) or 1))
+            except Exception:
+                duoc_url = None
+
+        key = ("alias", alias_norm, canonical_norm)
+        if key not in seen:
+            seen.add(key)
+            items.append(
+                {
+                    "term_norm": alias_norm,
+                    "canonical": canonical_norm if canonical_norm else alias_norm,
+                    "kind": "alias",
+                    "display": alias,
+                    "duoc_url": duoc_url,
+                    "priority": 2,
+                }
+            )
+
+    # canonical terms
+    for canonical in set(alias_map.values()):
+        canonical_norm = norm_text(canonical)
+        if not canonical_norm:
+            continue
+
+        key = ("canonical", canonical_norm, canonical_norm)
+        if key not in seen:
+            seen.add(key)
+            items.append(
+                {
+                    "term_norm": canonical_norm,
+                    "canonical": canonical_norm,
+                    "kind": "canonical",
+                    "display": canonical,
+                    "duoc_url": None,
+                    "priority": 1,
+                }
+            )
+
+    # fallback
+    for alias, canonical in ALIAS_FALLBACK.items():
+        alias_norm = norm_text(alias)
+        canonical_norm = norm_text(canonical)
+
+        key = ("fallback", alias_norm, canonical_norm)
+        if key not in seen:
+            seen.add(key)
+            items.append(
+                {
+                    "term_norm": alias_norm,
+                    "canonical": canonical_norm if canonical_norm else alias_norm,
+                    "kind": "fallback",
+                    "display": alias,
+                    "duoc_url": None,
+                    "priority": 3,
+                }
+            )
+
+    items.sort(key=lambda x: (-len(x["term_norm"]), -x["priority"], x["term_norm"]))
+    return items
+
+
 # ============================================================
 # INPUT PARSING
 # ============================================================
@@ -382,6 +546,14 @@ QUESTION_NOISE_PATTERNS = [
     r"\bcó uống rượu được không\b", r"\bco uong ruou duoc khong\b",
     r"\bcó sao không\b", r"\bco sao khong\b",
     r"\bđược không\b", r"\bduoc khong\b",
+    r"\bcó tương tác gì\b", r"\bco tuong tac gi\b",
+    r"\bcó tương tác được với các chất nào hay không\b",
+    r"\bco tuong tac duoc voi cac chat nao hay khong\b",
+    r"\bcó tương tác với thuốc nào\b",
+    r"\bco tuong tac voi thuoc nao\b",
+    r"\bnhững tương tác quan trọng nào\b",
+    r"\binteractions?\b",
+    r"\binteraction\b",
     r"\buống\b", r"\bdùng\b",
     r"\bhoi\b", r"\bhỏi\b",
     r"\btoi\b", r"\btôi\b",
@@ -469,140 +641,109 @@ def map_to_entity(raw_text: str, alias_map: Dict[str, str], alias_sources: Dict[
     return Entity(raw=raw_text.strip(), canonical=x, drug_name_if_any=None, duoc_url=None)
 
 
-# ============================================================
-# EMBEDDING SUGGESTION AGENT
-# ============================================================
-@st.cache_data(show_spinner=False)
-def build_entity_vocabulary(alias_map_obj: Dict[str, str]) -> List[Dict[str, str]]:
-    """
-    Vocabulary gồm:
-    - alias / tên thương mại
-    - canonical / tên dược chất
-    - fallback đặc biệt
-    """
-    items: List[Dict[str, str]] = []
+def query_parser_agent_extract_mentions(
+    prompt: str,
+    alias_map: Dict[str, str],
+    alias_sources: Dict[str, Dict[str, Any]],
+) -> Tuple[List[str], List[AgentLog]]:
+    logs: List[AgentLog] = []
+    prompt_norm = norm_text(prompt)
+    catalog = build_alias_catalog(alias_map, alias_sources)
+
+    matches: List[Tuple[int, int, Dict[str, Any], str]] = []
+    occupied: List[Tuple[int, int]] = []
+
+    for item in catalog:
+        pat = regex_term_pattern(item["term_norm"])
+        for m in pat.finditer(prompt_norm):
+            s, e = m.span()
+
+            overlap = False
+            for os_, oe_ in occupied:
+                if not (e <= os_ or s >= oe_):
+                    overlap = True
+                    break
+            if overlap:
+                continue
+
+            occupied.append((s, e))
+            matches.append((s, e, item, prompt[s:e]))
+
+    matches.sort(key=lambda x: x[0])
+
+    raw_mentions: List[str] = []
     seen = set()
+    for _, _, item, raw_span in matches:
+        k = (item["term_norm"], item["canonical"])
+        if k in seen:
+            continue
+        seen.add(k)
+        raw_mentions.append(raw_span.strip())
 
-    for alias, canonical in alias_map_obj.items():
-        alias_norm = norm_text(alias)
-        canonical_norm = norm_text(canonical)
+    if raw_mentions:
+        logs.append(AgentLog("query_parser_agent", "ok", f"Nhận diện được {len(raw_mentions)} tên/thực thể trong câu hỏi tự nhiên."))
+        return raw_mentions[:MAX_ENTITIES], logs
 
-        if alias_norm:
-            key = ("trade_name", alias_norm, canonical_norm)
-            if key not in seen:
-                seen.add(key)
-                items.append(
-                    {
-                        "display": alias_norm,
-                        "type": "trade_name",
-                        "canonical": canonical_norm if canonical_norm else alias_norm,
-                    }
-                )
-
-        if canonical_norm:
-            key = ("active_ingredient", canonical_norm, canonical_norm)
-            if key not in seen:
-                seen.add(key)
-                items.append(
-                    {
-                        "display": canonical_norm,
-                        "type": "active_ingredient",
-                        "canonical": canonical_norm,
-                    }
-                )
-
-    for alias, canonical in ALIAS_FALLBACK.items():
-        alias_norm = norm_text(alias)
-        canonical_norm = norm_text(canonical)
-
-        if alias_norm:
-            key = ("other", alias_norm, canonical_norm)
-            if key not in seen:
-                seen.add(key)
-                items.append(
-                    {
-                        "display": alias_norm,
-                        "type": "other",
-                        "canonical": canonical_norm if canonical_norm else alias_norm,
-                    }
-                )
-
-        if canonical_norm:
-            key = ("active_ingredient", canonical_norm, canonical_norm)
-            if key not in seen:
-                seen.add(key)
-                items.append(
-                    {
-                        "display": canonical_norm,
-                        "type": "active_ingredient",
-                        "canonical": canonical_norm,
-                    }
-                )
-
-    return items
+    fallback = split_to_entities(prompt)
+    logs.append(AgentLog("query_parser_agent", "warn", f"Không detect được entity rõ ràng bằng alias scan, fallback sang tách chuỗi thường: {len(fallback)} mục."))
+    return fallback[:MAX_ENTITIES], logs
 
 
-@st.cache_resource
-def build_entity_vocab_embeddings(vocab_json: str):
-    vocab_items = json.loads(vocab_json)
-    texts = [x["display"] for x in vocab_items]
-    emb = get_embeddings()
-    vecs = emb.embed_documents(texts)
-    arr = np.array(vecs, dtype=np.float32)
-    return arr
+def entity_linker_agent_link_mentions(
+    raw_mentions: List[str],
+    alias_map: Dict[str, str],
+    alias_sources: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Entity], List[AgentLog]]:
+    logs: List[AgentLog] = []
+    entities = [map_to_entity(x, alias_map, alias_sources) for x in raw_mentions]
+
+    uniq_entities: List[Entity] = []
+    seen = set()
+    for e in entities:
+        if not e.canonical or e.canonical in seen:
+            continue
+        seen.add(e.canonical)
+        uniq_entities.append(e)
+
+    logs.append(AgentLog("entity_linker_agent", "ok", f"Chuẩn hoá được {len(uniq_entities)} thực thể canonical duy nhất."))
+    return uniq_entities, logs
 
 
-def suggestion_agent_find_nearest(raw_text: str, alias_map_obj: Dict[str, str]) -> Optional[SuggestionItem]:
-    raw_norm = norm_text(raw_text)
-    if not raw_norm:
-        return None
+def build_rag_focus_prompt(original_prompt: str, entities: List[Entity]) -> str:
+    if not entities:
+        return original_prompt
 
-    # exact match thì không hỏi
-    if raw_norm in alias_map_obj or raw_norm in ALIAS_FALLBACK:
-        return None
+    canonical_terms = [e.canonical for e in entities]
+    joined = " + ".join(canonical_terms)
 
-    vocab_items = build_entity_vocabulary(alias_map_obj)
-    if not vocab_items:
-        return None
+    q_norm = norm_text(original_prompt)
 
-    vocab_json = json.dumps(vocab_items, ensure_ascii=False, sort_keys=True)
-    vocab_vecs = build_entity_vocab_embeddings(vocab_json)
+    if any(x in q_norm for x in ["tuong tac", "interaction", "interact", "luu y", "can than", "có gì cần lưu ý"]):
+        return f"Tương tác thuốc liên quan đến {joined}"
 
-    emb = get_embeddings()
-    q_vec = np.array(emb.embed_query(raw_norm), dtype=np.float32)
+    if len(canonical_terms) == 1:
+        return canonical_terms[0]
 
-    sims = np.dot(vocab_vecs, q_vec) / (np.linalg.norm(vocab_vecs, axis=1) * np.linalg.norm(q_vec) + 1e-12)
-    best_idx = int(np.argmax(sims))
-    best_score = float(sims[best_idx])
-    best_item = vocab_items[best_idx]
-
-    if best_score < SUGGESTION_MIN_SCORE:
-        return None
-
-    # tránh hỏi vô ích nếu normalize giống hệt
-    if norm_text(best_item["display"]) == raw_norm:
-        return None
-
-    return SuggestionItem(
-        raw_text=raw_text,
-        suggested_text=best_item["display"],
-        suggested_type=best_item["type"],
-        canonical_if_selected=best_item["canonical"],
-        score=best_score,
-    )
+    return joined
 
 
-def suggestion_agent_collect(raw_items: List[str], alias_map_obj: Dict[str, str]) -> List[SuggestionItem]:
-    suggestions: List[SuggestionItem] = []
-    for item in raw_items:
-        sug = suggestion_agent_find_nearest(item, alias_map_obj)
-        if sug is not None:
-            suggestions.append(sug)
-    return suggestions
+def normalize_prompt_for_rag(
+    prompt: str,
+    alias_map: Dict[str, str],
+    alias_sources: Dict[str, Dict[str, Any]],
+) -> Tuple[str, List[Entity], List[AgentLog]]:
+    parser_mentions, parser_logs = query_parser_agent_extract_mentions(prompt, alias_map, alias_sources)
+    entities, linker_logs = entity_linker_agent_link_mentions(parser_mentions, alias_map, alias_sources)
+
+    logs = parser_logs + linker_logs
+
+    prompt_norm = build_rag_focus_prompt(prompt, entities)
+    logs.append(AgentLog("entity_linker_agent", "ok", f"Prompt RAG sau chuẩn hoá: `{prompt_norm}`"))
+    return prompt_norm, entities, logs
 
 
 # ============================================================
-# HEADER MATCH HELPERS (OR / PARENTHESES SUPPORT)
+# HEADER MATCH HELPERS
 # ============================================================
 def side_contains_entity(side_text: str, entity: str) -> bool:
     side_norm = norm_text(side_text)
@@ -864,6 +1005,76 @@ def retriever_agent_stockley(stockley_db: Chroma, task: PairTask) -> RetrievalRe
     return RetrievalResult(pages=pages, logs=logs)
 
 
+def retrieve_general_rag_chunks(
+    stockley_db: Chroma,
+    prompt: str,
+    entities: List[Entity],
+) -> Tuple[List[RAGChunk], List[AgentLog]]:
+    logs: List[AgentLog] = []
+
+    canonical_terms = [e.canonical for e in entities]
+    queries: List[str] = []
+
+    if prompt:
+        queries.append(prompt)
+        queries.append(norm_text(prompt))
+
+    if canonical_terms:
+        queries.append(" + ".join(canonical_terms))
+        for term in canonical_terms:
+            queries.append(term)
+            queries.append(f"drug interaction {term}")
+            queries.append(f"{term} interaction")
+
+        if len(canonical_terms) >= 2:
+            for a, b in itertools.combinations(canonical_terms[:4], 2):
+                queries.append(f"{a} + {b}")
+
+    queries = uniq_keep_order([q for q in queries if clean_inline_text(q)])
+
+    docs: List[Document] = []
+    for q in queries:
+        part = retrieve_candidates_stockley(stockley_db, q, k=MAX_STOCKLEY_CANDIDATES)
+        docs.extend(part)
+        logs.append(AgentLog("stockley_retriever_agent", "ok", f"RAG query `{q}` trả về {len(part)} candidate docs."))
+
+    chunks: List[RAGChunk] = []
+    seen = set()
+
+    for d in docs:
+        meta = d.metadata or {}
+        try:
+            page = int(meta.get("page"))
+        except Exception:
+            continue
+
+        if not is_valid_stockley_page(page):
+            continue
+
+        txt = clean_chunk_text(getattr(d, "page_content", "") or "", max_len=850)
+        if not txt:
+            continue
+
+        key = (page, txt[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        chunks.append(
+            RAGChunk(
+                page=page,
+                text=txt,
+                open_url=build_remote_pdf_url("stockley_9e", page),
+            )
+        )
+
+        if len(chunks) >= MAX_RAG_DOCS:
+            break
+
+    logs.append(AgentLog("stockley_retriever_agent", "ok", f"Giữ lại {len(chunks)} chunks sau dedupe."))
+    return chunks, logs
+
+
 def header_agent_find_candidates(page_no_1idx: int, a: str, b: str) -> List[HeaderCandidate]:
     blocks = get_stockley_page_blocks(page_no_1idx)
     if not blocks:
@@ -996,6 +1207,63 @@ def coordinator_agent_run_pair(stockley_db: Chroma, task: PairTask, use_translat
     return result
 
 
+def coordinator_agent_run_general_rag(
+    stockley_db: Chroma,
+    user_prompt: str,
+    alias_map: Dict[str, str],
+    alias_sources: Dict[str, Dict[str, Any]],
+    use_rag_model: bool,
+) -> GeneralRAGResult:
+    prompt_norm, entities, norm_logs = normalize_prompt_for_rag(
+        user_prompt,
+        alias_map,
+        alias_sources,
+    )
+
+    chunks, logs = retrieve_general_rag_chunks(stockley_db, prompt_norm, entities)
+    logs = norm_logs + logs
+
+    if not chunks:
+        logs.append(AgentLog("answer_synthesizer_agent", "miss", "Không có chunk phù hợp để sinh câu trả lời."))
+        return GeneralRAGResult(
+            prompt=user_prompt,
+            normalized_prompt=prompt_norm,
+            entities=entities,
+            answer_vi=None,
+            answer_raw=None,
+            chunks=[],
+            logs=logs,
+        )
+
+    if not use_rag_model:
+        logs.append(AgentLog("answer_synthesizer_agent", "warn", f"Model RAG `{OLLAMA_RAG_MODEL}` chưa sẵn sàng, chỉ hiển thị retrieved chunks."))
+        return GeneralRAGResult(
+            prompt=user_prompt,
+            normalized_prompt=prompt_norm,
+            entities=entities,
+            answer_vi=None,
+            answer_raw=None,
+            chunks=chunks,
+            logs=logs,
+        )
+
+    answer_vi, err = generate_general_rag_answer(prompt_norm, chunks)
+    if err:
+        logs.append(AgentLog("answer_synthesizer_agent", "warn", err))
+    else:
+        logs.append(AgentLog("answer_synthesizer_agent", "ok", f"Đã tạo câu trả lời RAG bằng model `{OLLAMA_RAG_MODEL}`."))
+
+    return GeneralRAGResult(
+        prompt=user_prompt,
+        normalized_prompt=prompt_norm,
+        entities=entities,
+        answer_vi=answer_vi,
+        answer_raw=answer_vi,
+        chunks=chunks,
+        logs=logs,
+    )
+
+
 # ============================================================
 # HIGHLIGHT
 # ============================================================
@@ -1094,8 +1362,8 @@ def make_stockley_highlight_preview(ev: EvidenceItem, a: Entity, b: Entity) -> E
 # ============================================================
 # UI HELPERS
 # ============================================================
-def render_agent_trace(logs: List[AgentLog], pair_idx: int):
-    with st.expander(f"🧠 Agent trace cho cặp {pair_idx}", expanded=False):
+def render_agent_trace(logs: List[AgentLog], title: str):
+    with st.expander(title, expanded=False):
         st.markdown("**Agent trace** là nhật ký để xem từng agent đã làm gì, pass/fail ở đâu, rất hữu ích để debug và tinh chỉnh hệ thống.")
         for lg in logs:
             icon = "✅" if lg.status == "ok" else ("⚠️" if lg.status == "warn" else "⏭️" if lg.status == "skip" else "❌")
@@ -1139,14 +1407,13 @@ def render_pair_block(result: PairResult, pair_idx: int):
 
         st.markdown("### Trích dẫn Stockley")
         st.markdown(f"- **Nguồn:** {SOURCE_LABELS['stockley_9e']}")
-        
 
         if ev.interaction_summary_en:
-            st.markdown("### Mô tả tương tác ngắn ")
+            st.markdown("### Mô tả tương tác ngắn")
             st.markdown(ev.interaction_summary_en)
 
         if ev.interaction_summary_vi:
-            st.markdown(f"### Bản dịch tiếng Việt ")
+            st.markdown("### Bản dịch tiếng Việt")
             st.markdown(ev.interaction_summary_vi)
 
         if ev.open_url:
@@ -1172,87 +1439,124 @@ def render_pair_block(result: PairResult, pair_idx: int):
                     data=f.read(),
                     file_name=os.path.basename(ev.cache_pdf_path),
                     mime="application/pdf",
-                    key=f"dl_pair_{pair_idx}_{ev.page}",
+                    key=f"dl_pair_{pair_idx}_{ev.page}_{a.canonical}_{b.canonical}",
                     use_container_width=False,
                 )
 
-    render_agent_trace(result.logs, pair_idx)
+    render_agent_trace(result.logs, f"🧠 Agent trace cho cặp {pair_idx}")
     st.markdown("---")
 
 
-def render_pending_suggestions():
-    pending = st.session_state.get("pending_suggestions")
-    if not pending:
-        return
+def render_general_rag_block(result: GeneralRAGResult):
+    st.markdown("## RAG mode")
 
-    st.info("Mình thấy có vài tên có thể bị gõ sai. Hãy xác nhận từng tên trước khi tra cứu tiếp.")
+    st.markdown("### Câu hỏi gốc")
+    st.markdown(result.prompt)
 
-    items = pending["items"]
-    for idx, item in enumerate(items):
-        raw_text = item["raw_text"]
-        suggested_text = item["suggested_text"]
-        suggested_type = item["suggested_type"]
-        score = item["score"]
-        decision = item.get("decision")
+    st.markdown("### Chuẩn hoá thực thể")
+    if result.entities:
+        for e in result.entities:
+            line = f"- **{e.raw}** → `{e.canonical}`"
+            if e.drug_name_if_any and e.duoc_url:
+                st.markdown(line)
+                try:
+                    st.link_button(
+                        f"📌 Nguồn Dược thư ({e.drug_name_if_any})",
+                        e.duoc_url,
+                        use_container_width=False,
+                        key=f"duoc_rag_{e.raw}_{e.canonical}",
+                    )
+                except TypeError:
+                    st.markdown(f"[Nguồn Dược thư]({e.duoc_url})")
+            else:
+                st.markdown(line)
+    else:
+        st.markdown("- Không chuẩn hoá được thực thể nào, dùng câu hỏi gốc để retrieve.")
 
-        label_type = {
-            "trade_name": "tên thương mại",
-            "active_ingredient": "dược chất",
-            "other": "thực thể khác",
-        }.get(suggested_type, "thực thể")
+    st.markdown("### Prompt sau chuẩn hoá để retrieve")
+    st.code(result.normalized_prompt)
 
-        st.markdown(f"### Xác nhận tên `{raw_text}`")
-        st.markdown(f"- Gợi ý gần nhất: **{suggested_text}**")
-        st.markdown(f"- Loại gợi ý: **{label_type}**")
-        st.markdown(f"- Độ gần đúng embedding: `{score:.3f}`")
+    st.markdown("### Câu trả lời tổng hợp")
+    if result.answer_vi:
+        st.markdown(result.answer_vi)
+    else:
+        st.warning("Chưa tạo được câu trả lời tổng hợp bằng model RAG. Bên dưới là các đoạn context đã retrieve.")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button(f"✅ Đúng, dùng `{suggested_text}`", key=f"suggest_yes_{idx}"):
-                pending["items"][idx]["decision"] = "accept"
-                st.session_state.pending_suggestions = pending
-                st.rerun()
+    st.markdown("### Retrieved context từ Stockley")
+    for i, ch in enumerate(result.chunks, start=1):
+        st.markdown(f"**Chunk {i} — trang {ch.page}**")
+        st.markdown(ch.text)
+        if ch.open_url:
+            try:
+                st.link_button(
+                    f"🔗 Mở PDF trang {ch.page}",
+                    ch.open_url,
+                    use_container_width=False,
+                    key=f"open_general_{i}_{ch.page}"
+                )
+            except TypeError:
+                st.markdown(f"[Mở PDF trang {ch.page}]({ch.open_url})")
+        st.markdown("---")
 
-        with col2:
-            if st.button(f"↩️ Giữ nguyên `{raw_text}`", key=f"suggest_no_{idx}"):
-                pending["items"][idx]["decision"] = "keep"
-                st.session_state.pending_suggestions = pending
-                st.rerun()
-
-        if decision == "accept":
-            st.success(f"Đã chọn dùng `{suggested_text}`")
-        elif decision == "keep":
-            st.warning(f"Giữ nguyên `{raw_text}`")
-
-    unresolved = [x for x in pending["items"] if x.get("decision") is None]
-    if not unresolved:
-        if st.button("🚀 Tra cứu lại với các xác nhận ở trên", key="run_after_confirm"):
-            raw_items = pending["raw_items"]
-            mapping = {}
-            for item in pending["items"]:
-                if item["decision"] == "accept":
-                    mapping[norm_text(item["raw_text"])] = item["suggested_text"]
-                else:
-                    mapping[norm_text(item["raw_text"])] = item["raw_text"]
-
-            resolved_items = [mapping.get(norm_text(x), x) for x in raw_items]
-
-            st.session_state["resolved_prompt_from_suggestions"] = " + ".join(resolved_items)
-            st.session_state["pending_suggestions"] = None
-            st.rerun()
+    render_agent_trace(result.logs, "🧠 Agent trace cho RAG mode")
 
 
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
-def run_full_pipeline(prompt: str, stockley_db: Chroma, alias_map: Dict[str, str], alias_sources: Dict[str, Dict[str, Any]], ollama_ok: bool):
+def run_full_pipeline(
+    prompt: str,
+    stockley_db: Chroma,
+    alias_map: Dict[str, str],
+    alias_sources: Dict[str, Dict[str, Any]],
+    translate_ok: bool,
+    rag_ok: bool,
+    feature_mode: str,
+):
     with st.chat_message("assistant"):
         try:
             with st.spinner("Coordinator agent đang điều phối các subagents..."):
+
+                # ====================================================
+                # FEATURE 2: RAG mode
+                # ====================================================
+                if feature_mode == FEATURE_RAG:
+                    result = coordinator_agent_run_general_rag(
+                        stockley_db=stockley_db,
+                        user_prompt=prompt,
+                        alias_map=alias_map,
+                        alias_sources=alias_sources,
+                        use_rag_model=rag_ok,
+                    )
+
+                    render_general_rag_block(result)
+
+                    short_answer = result.answer_vi or "Đã retrieve các context liên quan nhưng chưa tổng hợp được câu trả lời tự động."
+                    st.session_state.history.append(
+                        {
+                            "role": "assistant",
+                            "content": f"Kết quả RAG:\n{short_answer}",
+                        }
+                    )
+                    return
+
+                # ====================================================
+                # FEATURE 1: Pairwise mode
+                # ====================================================
                 tasks, uniq_entities, planner_logs = planner_agent_build_tasks(prompt, alias_map, alias_sources)
 
+                if len(uniq_entities) == 0:
+                    answer = "Không nhận diện được dược chất hợp lệ để tra cứu."
+                    st.markdown(answer)
+                    st.session_state.history.append({"role": "assistant", "content": answer})
+                    return
+
                 if len(uniq_entities) < 2:
-                    answer = "Sau khi chuẩn hoá, chưa còn đủ 2 dược chất khác nhau để tra cứu."
+                    answer = (
+                        "Chế độ hiện tại là **Kiểm tra tương tác theo cặp**, "
+                        "nên bạn hãy nhập ít nhất 2 thuốc hoặc dược chất.\n\n"
+                        "Ví dụ: `paracetamol + caffeine`"
+                    )
                     st.markdown(answer)
                     st.session_state.history.append({"role": "assistant", "content": answer})
                     return
@@ -1266,7 +1570,7 @@ def run_full_pipeline(prompt: str, stockley_db: Chroma, alias_map: Dict[str, str
                     pair_result = coordinator_agent_run_pair(
                         stockley_db=stockley_db,
                         task=task,
-                        use_translation=ollama_ok,
+                        use_translation=translate_ok,
                     )
 
                     if pair_result.evidence is not None:
@@ -1314,6 +1618,18 @@ st.set_page_config(page_title="DrugSafe AI", page_icon="💊", layout="wide")
 st.title("💊 DrugSafe AI - tra cứu tương tác thuốc")
 st.warning("⚠️ Công cụ hỗ trợ tham khảo, không thay thế tư vấn bác sĩ/dược sĩ.")
 
+feature_mode = st.selectbox(
+    "Chọn chế độ",
+    [FEATURE_PAIRWISE, FEATURE_RAG],
+    index=0,
+    help="Bạn có thể đổi chế độ bất cứ lúc nào. Chọn xong rồi hỏi tiếp là được.",
+)
+
+if feature_mode == FEATURE_PAIRWISE:
+    st.caption("Chế độ hiện tại: kiểm tra tương tác theo từng cặp, có verify header và highlight PDF.")
+else:
+    st.caption("Chế độ hiện tại: RAG multi-agent. Hệ thống sẽ tách entity từ câu hỏi, chuẩn hoá tên thương mại sang dược chất, retrieve từ Stockley, rồi mới tổng hợp câu trả lời.")
+
 stockley_db = load_stockley_db()
 if stockley_db is None:
     st.error("❌ Chưa có Chroma DB Stockley. Hãy build trước: `python etl/04_build_chroma.py`")
@@ -1326,22 +1642,32 @@ if not os.path.exists(RAW_PDFS["stockley_9e"]):
 alias_map = load_alias_map()
 alias_sources = load_alias_sources_index()
 
-ollama_ok, ollama_msg = check_ollama_available()
-if ollama_ok:
-    st.success(f"✅ Công cụ dịch sẵn sàng với model `{OLLAMA_MODEL}`")
+translate_ok, translate_msg = check_ollama_model_available(OLLAMA_MODEL)
+rag_ok, rag_msg = check_ollama_model_available(OLLAMA_RAG_MODEL)
+
+if translate_ok:
+    st.success(f"✅ Model dịch sẵn sàng: `{OLLAMA_MODEL}`")
 else:
-    st.info(f"ℹ️ Công cụ dịch chưa sẵn sàng. App vẫn chạy bình thường nhưng chưa dịch được: {ollama_msg}")
+    st.info(f"ℹ️ Model dịch chưa sẵn sàng: {translate_msg}")
+
+if rag_ok:
+    st.success(f"✅ Model RAG sẵn sàng: `{OLLAMA_RAG_MODEL}`")
+else:
+    st.info(f"ℹ️ Model RAG chưa sẵn sàng: {rag_msg}")
 
 if "history" not in st.session_state:
     st.session_state.history = [
         {
             "role": "assistant",
             "content": (
-                f"Xin chào tôi là chatbot tra cứu tương tác thuốc, bạn cần tra cứu tương tác thuốc gì?\n\n"
+                "Xin chào tôi là chatbot tra cứu tương tác thuốc.\n\n"
+                "Bạn có thể đổi chế độ ở phía trên bất cứ lúc nào.\n\n"
                 "Ví dụ:\n"
-                "- `paracetamol và coffe`\n"
-                "- `Lidocaine + Rifampicin`\n"
-                "- `Disopyramide và Rifampicin và paracetamol`"
+                "- Pairwise mode: `paracetamol + caffeine`\n"
+                "- Pairwise mode: `Disopyramide + Rifampicin + paracetamol`\n"
+                "- RAG mode: `warfarin có những tương tác quan trọng nào?`\n"
+                "- RAG mode: `Tatanol và rượu có gì cần lưu ý?`\n"
+                "- RAG mode: `Pancidol có tương tác với các chất nào?`"
             ),
         }
     ]
@@ -1350,43 +1676,20 @@ for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-render_pending_suggestions()
+prompt = st.chat_input("Nhập câu hỏi hoặc tên thuốc để tra cứu")
 
-prompt = st.chat_input(f"Nhập các tên thuốc hoặc dược chất để tra cứu")
-
-resolved_prompt = st.session_state.get("resolved_prompt_from_suggestions")
-if resolved_prompt:
-    st.session_state["resolved_prompt_from_suggestions"] = None
-    st.session_state.history.append({"role": "user", "content": resolved_prompt})
-    with st.chat_message("user"):
-        st.markdown(resolved_prompt)
-    run_full_pipeline(resolved_prompt, stockley_db, alias_map, alias_sources, ollama_ok)
-
-elif prompt:
+if prompt:
     st.session_state.history.append({"role": "user", "content": prompt})
 
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    raw_items = split_to_entities(prompt)
-    suggestions = suggestion_agent_collect(raw_items, alias_map)
-
-    if suggestions:
-        st.session_state["pending_suggestions"] = {
-            "original_prompt": prompt,
-            "raw_items": raw_items,
-            "items": [
-                {
-                    "raw_text": s.raw_text,
-                    "suggested_text": s.suggested_text,
-                    "suggested_type": s.suggested_type,
-                    "canonical_if_selected": s.canonical_if_selected,
-                    "score": s.score,
-                    "decision": None,
-                }
-                for s in suggestions
-            ],
-        }
-        st.rerun()
-    else:
-        run_full_pipeline(prompt, stockley_db, alias_map, alias_sources, ollama_ok)
+    run_full_pipeline(
+        prompt,
+        stockley_db,
+        alias_map,
+        alias_sources,
+        translate_ok,
+        rag_ok,
+        feature_mode,
+    )
